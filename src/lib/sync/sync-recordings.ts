@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { and, eq, isNull, ne, notInArray, or } from "drizzle-orm";
 import { db } from "@/db";
 import {
@@ -278,7 +279,7 @@ interface CapState {
 }
 
 async function processRecording(
-    plaudRecording: PlaudRecording,
+    listedRecording: PlaudRecording,
     context: SyncContext,
     plaudClient: Awaited<ReturnType<typeof createPlaudClient>>,
     storage: Awaited<ReturnType<typeof createUserStorageProvider>>,
@@ -292,6 +293,7 @@ async function processRecording(
     importCandidate?: ImportCandidate;
     capExceeded?: boolean;
 }> {
+    let plaudRecording = listedRecording;
     try {
         const [existingRecording] = await db
             .select()
@@ -343,6 +345,8 @@ async function processRecording(
             return { status: "skipped" };
         }
 
+        plaudRecording = await plaudClient.hydrateRecording(plaudRecording);
+
         // Storage cap: gate NEW recordings before spending Plaud egress.
         // Updates replace an existing blob (roughly size-neutral) and are
         // left untouched so a near-cap user can still receive edits.
@@ -384,8 +388,10 @@ async function processRecording(
             duration: plaudRecording.duration,
             startTime: new Date(plaudRecording.start_time),
             endTime: new Date(plaudRecording.end_time),
-            filesize: plaudRecording.filesize,
-            fileMd5: plaudRecording.file_md5,
+            filesize: plaudRecording.filesize || audioBuffer.length,
+            fileMd5:
+                plaudRecording.file_md5 ||
+                createHash("md5").update(audioBuffer).digest("hex"),
             storageType: env.DEFAULT_STORAGE_TYPE,
             storagePath: storageKey,
             downloadedAt: new Date(),
