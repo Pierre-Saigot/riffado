@@ -100,7 +100,7 @@ export function mapPlaudV4Item(item: PlaudV4RecordingItem): PlaudRecording {
         ori_ready: true,
         version: version,
         version_ms: version,
-        edit_time: item.updated_at_show_ms ?? version,
+        edit_time: Math.max(item.updated_at_show_ms ?? 0, version),
         edit_from: "",
         is_trash: false,
         start_time: start,
@@ -117,12 +117,34 @@ export function mapPlaudV4Item(item: PlaudV4RecordingItem): PlaudRecording {
     };
 }
 
+/**
+ * Order v4 listings like the legacy `sort_by` / `is_desc` parameters.
+ * `recordings/all` only sorts by creation, but sync expects most recently
+ * edited first (it stops after unchanged pages).
+ */
+export function sortPlaudRecordings(
+    recordings: PlaudRecording[],
+    sortBy: string,
+    isDesc: boolean,
+): PlaudRecording[] {
+    const key = (r: PlaudRecording) =>
+        sortBy === "start_time" ? r.start_time : r.edit_time;
+    const dir = isDesc ? -1 : 1;
+    return [...recordings].sort(
+        (a, b) =>
+            dir * (key(a) - key(b)) || dir * (a.start_time - b.start_time),
+    );
+}
+
 function readyObject(
     detail: PlaudV4FileDetail | undefined,
     type: string,
 ): PlaudV4FileObject | undefined {
     return detail?.objects?.find(
-        (o) => o.object_type === type && o.task_status === 1 && o.content_url,
+        (o) =>
+            o.object_type === type &&
+            o.task_status === 1 &&
+            Boolean(o.content_url || o.content_id),
     );
 }
 

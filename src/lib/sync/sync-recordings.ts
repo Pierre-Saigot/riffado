@@ -369,6 +369,17 @@ async function processRecording(
             false,
         );
 
+        if (!existingRecording && !plaudRecording.filesize) {
+            const cap = await enforceStorageCap({
+                userId: context.userId,
+                additionalBytes: audioBuffer.length,
+            });
+            if (!cap.allowed) {
+                capState.blocked = true;
+                return { status: "skipped", capExceeded: true };
+            }
+        }
+
         const sniffed = sniffAudio(audioBuffer);
         const fileExtension = sniffed.extension;
         const storageKey = await resolveStorageKey(

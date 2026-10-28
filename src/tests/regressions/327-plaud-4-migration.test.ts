@@ -61,6 +61,10 @@ let renameConflictsLeft = 0;
 // Per-recording folder (what the Plaud library lists).
 let folderName = "2026-10-28 11:43:10";
 let parentItemsInRename = true;
+let folderConflictsLeft = 0;
+let childrenFolderName: string | undefined;
+let oldEditedVersion: number | undefined;
+let transcriptUrlInDetail = true;
 
 function installPlaudMock() {
     calls.length = 0;
@@ -68,6 +72,10 @@ function installPlaudMock() {
     renameConflictsLeft = 0;
     folderName = "2026-10-28 11:43:10";
     parentItemsInRename = true;
+    folderConflictsLeft = 0;
+    childrenFolderName = undefined;
+    oldEditedVersion = undefined;
+    transcriptUrlInDetail = true;
     global.fetch = vi.fn(
         async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
@@ -101,21 +109,52 @@ function installPlaudMock() {
                     data: {
                         items: [],
                         parent_items: parentItemsInRename
-                            ? [{ node_id: "n_folder", version_ms: 77 }]
+                            ? [
+                                  {
+                                      node_id: "n_folder",
+                                      name: folderName,
+                                      version_ms: 77,
+                                  },
+                              ]
                             : [],
                     },
                 });
             }
             if (u.pathname === "/file-app/v4/nodes/rename/n_folder") {
+                if (folderConflictsLeft > 0) {
+                    folderConflictsLeft--;
+                    return json({
+                        status: -1800313,
+                        msg: "node version conflict",
+                    });
+                }
                 return json({ status: 0, data: { items: [] } });
+            }
+            if (u.pathname === "/file-app/v4/files/content/url") {
+                const { content_ids } = JSON.parse(String(init?.body));
+                return json({
+                    status: 0,
+                    data: {
+                        url_map: Object.fromEntries(
+                            (content_ids as string[]).map((id) => [
+                                id,
+                                "https://bucket.s3.amazonaws.com/trans_result.json.gz?sig=resolved",
+                            ]),
+                        ),
+                    },
+                });
             }
             if (u.pathname === "/file-app/v4/folders/children") {
                 return json({
                     status: 0,
                     data: {
                         items: [
-                            { node_id: "n_other", version_ms: 1 },
-                            { node_id: "n_folder", version_ms: 88 },
+                            { node_id: "n_other", name: "x", version_ms: 1 },
+                            {
+                                node_id: "n_folder",
+                                name: childrenFolderName ?? folderName,
+                                version_ms: 88,
+                            },
                         ],
                         next_cursor: null,
                     },
@@ -158,7 +197,7 @@ function installPlaudMock() {
                                 name: "Tarification",
                                 duration_ms: 1862000,
                                 created_at_show_ms: 1792683867000,
-                                version_ms: 1792683867616,
+                                version_ms: oldEditedVersion ?? 1792683867616,
                             },
                         ],
                         next_cursor: null,
@@ -210,8 +249,9 @@ function installPlaudMock() {
                             {
                                 object_type: "TRANSCRIPT",
                                 content_id: "c_trans",
-                                content_url:
-                                    "https://bucket.s3.amazonaws.com/trans_result.json.gz?sig=2",
+                                content_url: transcriptUrlInDetail
+                                    ? "https://bucket.s3.amazonaws.com/trans_result.json.gz?sig=2"
+                                    : null,
                                 mime_type: "text/vnd.plaud.transcript+json",
                                 task_status: 1,
                             },
@@ -391,6 +431,29 @@ describe("PlaudClient on a 4.0-migrated account", () => {
         expect(client.usingPlaudV4).toBe(true);
     });
 
+    it("serves pages most recently edited first, like the legacy edit_time sort", async () => {
+        oldEditedVersion = 1793300000000;
+        const client = new PlaudClient("ut-1", API, "ws_test");
+        const page = await client.getRecordings(0, 3, 0, "edit_time", true);
+        expect(page.data_file_list.map((r) => r.id)).toEqual([
+            "ed242f55f01779b404852ebb44e641d5",
+            "f_new",
+            "34f465e07b50f0a01cb76302d6c6eaa7",
+        ]);
+        const byStart = await client.getRecordings(
+            0,
+            3,
+            0,
+            "start_time",
+            false,
+        );
+        expect(byStart.data_file_list.map((r) => r.id)).toEqual([
+            "ed242f55f01779b404852ebb44e641d5",
+            "34f465e07b50f0a01cb76302d6c6eaa7",
+            "f_new",
+        ]);
+    });
+
     it("leaves legacy recordings untouched in hydrateRecording", async () => {
         const client = new PlaudClient("ut-1", API, "ws_test");
         const legacy = {
@@ -451,6 +514,25 @@ describe("Plaud-native content on a 4.0-migrated account", () => {
         const { transcript, summary } = selectContentItems(legacy);
         expect(transcript?.data_link).toBe("t");
         expect(summary?.data_link).toBe("s");
+    });
+
+    it("resolves content ids that come without a presigned URL", async () => {
+        transcriptUrlInDetail = false;
+        const client = new PlaudClient("ut-1", API, "ws_test");
+        const listed = (await client.getRecordings(0, 1, 0)).data_file_list[0];
+        const rec = await client.hydrateRecording(listed);
+        expect(rec.is_trans).toBe(true);
+        const { transcript } = selectContentItems(
+            await client.getFileDetail(rec.id),
+        );
+        expect(transcript?.data_link).toContain("sig=resolved");
+        const resolve = calls.filter((c) =>
+            c.url.includes("/files/content/url"),
+        );
+        expect(resolve).toHaveLength(1);
+        expect(JSON.parse(resolve[0].body ?? "{}")).toEqual({
+            content_ids: ["c_trans"],
+        });
     });
 
     it("serves the import pipeline from the v4 detail", async () => {
@@ -531,6 +613,26 @@ describe("PlaudClient title sync on a 4.0-migrated account", () => {
             c.url.includes("/nodes/rename/n_folder"),
         );
         expect(JSON.parse(folder?.body ?? "{}").origin_version).toBe(88);
+    });
+
+    it("re-checks the folder name before retrying a conflicted folder rename", async () => {
+        folderConflictsLeft = 1;
+        childrenFolderName = "Dossier client";
+        const client = new PlaudClient("ut-1", API, "ws_test");
+        await client.updateFilename("f_new", "Titre");
+        expect(
+            calls.filter((c) => c.url.includes("/nodes/rename/n_folder")),
+        ).toHaveLength(1);
+    });
+
+    it("retries a conflicted folder rename with the refreshed version", async () => {
+        folderConflictsLeft = 1;
+        const client = new PlaudClient("ut-1", API, "ws_test");
+        await client.updateFilename("f_new", "Titre");
+        const versions = calls
+            .filter((c) => c.url.includes("/nodes/rename/n_folder"))
+            .map((c) => JSON.parse(c.body ?? "{}").origin_version);
+        expect(versions).toEqual([77, 88]);
     });
 
     it("leaves a custom-named folder alone", async () => {

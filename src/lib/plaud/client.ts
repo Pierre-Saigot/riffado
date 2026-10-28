@@ -24,6 +24,7 @@ import {
     PLAUD_V4_VERSION_CONFLICT_STATUS,
     plaudV4DetailToLegacy,
     recordingIdToPlaudV4FileId,
+    sortPlaudRecordings,
 } from "./v4";
 import { resolveWorkspaceToken } from "./workspace";
 
@@ -277,7 +278,11 @@ export class PlaudClient {
                 data_file_list: [],
             };
         }
-        const all = await this.listAllRecordingsV4();
+        const all = sortPlaudRecordings(
+            await this.listAllRecordingsV4(),
+            sortBy,
+            isDesc,
+        );
         return {
             status: 0,
             msg: "success",
@@ -365,14 +370,8 @@ export class PlaudClient {
         if (audio?.content_url) return audio.content_url;
 
         if (audio?.content_id) {
-            const body = await this.request<PlaudV4ContentUrlResponse>(
-                "/file-app/v4/files/content/url",
-                {
-                    method: "POST",
-                    body: JSON.stringify({ content_ids: [audio.content_id] }),
-                },
-            );
-            const url = body?.data?.url_map?.[audio.content_id];
+            const urls = await this.resolveContentUrlsV4([audio.content_id]);
+            const url = urls[audio.content_id];
             if (url) return url;
         }
 
@@ -381,6 +380,47 @@ export class PlaudClient {
             "Plaud has no downloadable audio for this recording yet.",
             400,
         );
+    }
+
+    /** Presigned URLs for v4 content ids (`/file-app/v4/files/content/url`). */
+    private async resolveContentUrlsV4(
+        contentIds: string[],
+    ): Promise<Record<string, string>> {
+        if (contentIds.length === 0) return {};
+        const body = await this.request<PlaudV4ContentUrlResponse>(
+            "/file-app/v4/files/content/url",
+            {
+                method: "POST",
+                body: JSON.stringify({ content_ids: contentIds }),
+            },
+        );
+        return body?.status === 0 ? (body.data?.url_map ?? {}) : {};
+    }
+
+    /** Fill missing transcript / summary URLs of a v4 detail. */
+    private async withContentUrlsV4(
+        detail: NonNullable<PlaudV4FileDetailResponse["data"]>,
+    ): Promise<NonNullable<PlaudV4FileDetailResponse["data"]>> {
+        const objects = detail.objects ?? [];
+        const missing = objects
+            .filter(
+                (o) =>
+                    (o.object_type === "TRANSCRIPT" ||
+                        o.object_type === "SUMMARY") &&
+                    !o.content_url &&
+                    o.content_id,
+            )
+            .map((o) => o.content_id as string);
+        if (missing.length === 0) return detail;
+        const urls = await this.resolveContentUrlsV4(missing);
+        return {
+            ...detail,
+            objects: objects.map((o) =>
+                !o.content_url && o.content_id && urls[o.content_id]
+                    ? { ...o, content_url: urls[o.content_id] }
+                    : o,
+            ),
+        };
     }
 
     async getTempUrl(
@@ -465,7 +505,9 @@ export class PlaudClient {
             if (!isPlaudV4MigratedResponse(body)) return body;
             this.v4Mode = true;
         }
-        return plaudV4DetailToLegacy(await this.getFileDetailV4(fileId));
+        return plaudV4DetailToLegacy(
+            await this.withContentUrlsV4(await this.getFileDetailV4(fileId)),
+        );
     }
 
     /**
@@ -548,26 +590,30 @@ export class PlaudClient {
         });
 
         const folder = fileNode?.folder;
+        const previousName = fileNode?.name;
         if (
             folder?.folder_id &&
             folder.name &&
-            folder.name === fileNode?.name &&
+            folder.name === previousName &&
             folder.name !== name
         ) {
             const folderId = folder.folder_id;
             const parentId = fileNode?.breadcrumbs?.[0]?.node_id;
-            let fromResponse = renamed.data?.parent_items?.find(
-                (p) => p.node_id === folderId,
-            )?.version_ms;
+            let fromResponse = renamed?.data?.parent_items?.find(
+                (p) => p.node_id === folderId && p.name !== undefined,
+            );
             try {
                 await this.renameNodeV4(name, async () => {
-                    const version =
+                    const current =
                         fromResponse ??
                         (parentId
-                            ? await this.findChildVersionV4(parentId, folderId)
+                            ? await this.findChildV4(parentId, folderId)
                             : undefined);
                     fromResponse = undefined;
-                    return { nodeId: folderId, version };
+                    if (!current || current.name !== previousName) {
+                        return { skip: true };
+                    }
+                    return { nodeId: folderId, version: current.version_ms };
                 });
             } catch (err) {
                 console.warn(
@@ -577,21 +623,28 @@ export class PlaudClient {
             }
         }
 
-        return { status: 0, msg: "success", data_file: renamed.data };
+        return { status: 0, msg: "success", data_file: renamed?.data };
     }
 
     /**
      * `PATCH /file-app/v4/nodes/rename/{node_id}` with the node's current
      * version as `origin_version` (optimistic locking). A stale version
      * answers `-1800313`: refetch and retry once, as the Plaud web app does.
+     * The resolver runs before each attempt and can return `skip` to stop
+     * without writing.
      */
     private async renameNodeV4(
         name: string,
-        resolve: () => Promise<{ nodeId?: string; version?: number }>,
-    ): Promise<PlaudV4RenameResponse> {
+        resolve: () => Promise<{
+            nodeId?: string;
+            version?: number;
+            skip?: boolean;
+        }>,
+    ): Promise<PlaudV4RenameResponse | undefined> {
         let lastStatus: number | undefined;
         for (let attempt = 0; attempt < 2; attempt++) {
-            const { nodeId, version } = await resolve();
+            const { nodeId, version, skip } = await resolve();
+            if (skip) return undefined;
             if (!nodeId || version === undefined) {
                 throw new AppError(
                     ErrorCode.PLAUD_API_ERROR,
@@ -625,11 +678,11 @@ export class PlaudClient {
         );
     }
 
-    /** Current `version_ms` of a folder child (scans a few pages). */
-    private async findChildVersionV4(
+    /** Current state of a folder child (scans a few pages). */
+    private async findChildV4(
         parentId: string,
         childId: string,
-    ): Promise<number | undefined> {
+    ): Promise<PlaudV4Node | undefined> {
         let cursor: string | undefined;
         for (let page = 0; page < 10; page++) {
             const params = new URLSearchParams({
@@ -642,7 +695,7 @@ export class PlaudClient {
             );
             const items = body?.data?.items ?? [];
             const hit = items.find((i) => i.node_id === childId);
-            if (hit) return hit.version_ms;
+            if (hit) return hit;
             const next = body?.data?.next_cursor;
             if (!next || items.length === 0) return undefined;
             cursor = next;
