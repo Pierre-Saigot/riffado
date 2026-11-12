@@ -148,6 +148,31 @@ function readyObject(
     );
 }
 
+const AUDIO_TYPES = ["AUDIO_TRANSCODED", "AUDIO"] as const;
+
+/**
+ * Audio object of a v4 file detail. Plaud can expose two copies: `AUDIO`, the
+ * recorder's raw upload (not a playable container on some 4.0 accounts), and
+ * `AUDIO_TRANSCODED`, the MP3 the Plaud player streams. Prefer the transcoded
+ * copy and fall back to `AUDIO`, which older files carry alone (Ogg/Opus).
+ * A downloadable object (URL or content id) wins over one without, so the
+ * size read and the download use the same object.
+ */
+export function pickAudioObject(
+    detail: PlaudV4FileDetail | undefined,
+): PlaudV4FileObject | undefined {
+    const objects = detail?.objects ?? [];
+    const byType = (downloadable: boolean) =>
+        AUDIO_TYPES.map((type) =>
+            objects.find(
+                (o) =>
+                    o.object_type === type &&
+                    (!downloadable || Boolean(o.content_url || o.content_id)),
+            ),
+        ).find(Boolean);
+    return byType(true) ?? byType(false);
+}
+
 /** Fill device, size, timezone and content flags from a v4 file detail. */
 export function applyPlaudV4Detail(
     recording: PlaudRecording,
@@ -155,7 +180,7 @@ export function applyPlaudV4Detail(
 ): PlaudRecording {
     if (!detail) return recording;
     const meta = detail.meta ?? {};
-    const audio = detail.objects?.find((o) => o.object_type === "AUDIO");
+    const audio = pickAudioObject(detail);
     const start = meta.start_time ?? recording.start_time;
     const duration = meta.duration ?? recording.duration;
     const offset = timeZoneOffsetMinutes(meta.timezone_iana, start);

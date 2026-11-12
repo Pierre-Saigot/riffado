@@ -34,6 +34,7 @@ import {
     applyPlaudV4Detail,
     isPlaudV4MigratedResponse,
     mapPlaudV4Item,
+    pickAudioObject,
     plaudV4DetailToLegacy,
     plaudV4FileIdToRecordingId,
     recordingIdToPlaudV4FileId,
@@ -65,6 +66,8 @@ let folderConflictsLeft = 0;
 let childrenFolderName: string | undefined;
 let oldEditedVersion: number | undefined;
 let transcriptUrlInDetail = true;
+// Second, player-ready copy of the audio (listed after the raw upload).
+let transcodedInDetail = false;
 
 function installPlaudMock() {
     calls.length = 0;
@@ -76,6 +79,7 @@ function installPlaudMock() {
     childrenFolderName = undefined;
     oldEditedVersion = undefined;
     transcriptUrlInDetail = true;
+    transcodedInDetail = false;
     global.fetch = vi.fn(
         async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
@@ -239,6 +243,18 @@ function installPlaudMock() {
                                 mime_type: "audio/ogg",
                                 object_size: 7004672,
                             },
+                            ...(transcodedInDetail
+                                ? [
+                                      {
+                                          object_type: "AUDIO_TRANSCODED",
+                                          content_id: "c_mp3",
+                                          content_url:
+                                              "https://bucket.s3.amazonaws.com/a.mp3?sig=4",
+                                          mime_type: "audio/mpeg",
+                                          object_size: 7100000,
+                                      },
+                                  ]
+                                : []),
                             {
                                 object_type: "OUTLINE",
                                 content_id: "c_outline",
@@ -291,6 +307,12 @@ function installPlaudMock() {
                                 },
                             ]),
                         ),
+                        { status: 200 },
+                    );
+                }
+                if (u.pathname === "/a.mp3") {
+                    return new Response(
+                        new Uint8Array([0x49, 0x44, 0x33, 0x04]),
                         { status: 200 },
                     );
                 }
@@ -369,6 +391,49 @@ describe("Plaud 4.0 helpers", () => {
     });
 });
 
+describe("pickAudioObject", () => {
+    const raw = {
+        object_type: "AUDIO",
+        content_url: "raw",
+        object_size: 51200,
+    };
+    const mp3 = {
+        object_type: "AUDIO_TRANSCODED",
+        content_url: "mp3",
+        object_size: 51777,
+    };
+
+    it("prefers AUDIO_TRANSCODED over AUDIO in any order", () => {
+        expect(pickAudioObject({ objects: [raw, mp3] })).toBe(mp3);
+        expect(pickAudioObject({ objects: [mp3, raw] })).toBe(mp3);
+    });
+
+    it("falls back to AUDIO when no transcoded copy exists", () => {
+        expect(pickAudioObject({ objects: [raw] })).toBe(raw);
+    });
+
+    it("prefers a downloadable object over one without URL or content id", () => {
+        const bare = { object_type: "AUDIO_TRANSCODED", object_size: 9 };
+        expect(pickAudioObject({ objects: [bare, raw] })).toBe(raw);
+        const byId = { object_type: "AUDIO", content_id: "c_1" };
+        expect(pickAudioObject({ objects: [bare, byId] })).toBe(byId);
+    });
+
+    it("still returns a size-only object, and nothing for an empty detail", () => {
+        const sizeOnly = { object_type: "AUDIO", object_size: 42 };
+        expect(pickAudioObject({ objects: [sizeOnly] })).toBe(sizeOnly);
+        expect(pickAudioObject({ objects: [] })).toBeUndefined();
+        expect(pickAudioObject(undefined)).toBeUndefined();
+    });
+
+    it("reads filesize from the transcoded copy in applyPlaudV4Detail", () => {
+        const listed = mapPlaudV4Item({ file_id: "f_x", version_ms: 1 });
+        expect(
+            applyPlaudV4Detail(listed, { objects: [raw, mp3] }).filesize,
+        ).toBe(51777);
+    });
+});
+
 describe("PlaudClient on a 4.0-migrated account", () => {
     it("falls back to /file-app/v4/recordings/all with skip/limit paging", async () => {
         const client = new PlaudClient("ut-1", API, "ws_test");
@@ -422,6 +487,19 @@ describe("PlaudClient on a 4.0-migrated account", () => {
         expect(calls.some((c) => c.url.includes("/file/temp-url/"))).toBe(
             false,
         );
+    });
+
+    it("downloads the transcoded MP3 when the detail also lists the raw upload", async () => {
+        transcodedInDetail = true;
+        const client = new PlaudClient("ut-1", API, "ws_test");
+        const { data_file_list } = await client.getRecordings(0, 1, 0);
+        const rec = await client.hydrateRecording(data_file_list[0]);
+        // The size is the stored copy's, not the raw upload's.
+        expect(rec.filesize).toBe(7100000);
+
+        const audio = await client.downloadRecording(rec.id, false);
+        expect(audio.subarray(0, 3).toString("latin1")).toBe("ID3");
+        expect(calls.some((c) => c.url.includes("/a.ogg"))).toBe(false);
     });
 
     it("switches to v4 when the legacy temp-url reports the migration", async () => {
